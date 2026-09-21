@@ -27,7 +27,10 @@ Under the hood **nothing is medical**. The pipeline is `upload → transcribe �
 | LLM | **Anthropic API.** `claude-sonnet-5` for extraction, `claude-haiku-4-5` for speaker-label suggestions and audio triage. |
 | Job status → UI | **Polling** `GET /v1/recordings/{id}`, 2s → 5s → 15s backoff. Not WebSockets. |
 | Hosting | **Fly.io `syd`** (API + worker as separate process groups), **Cloudflare Pages** (SPA). |
-| Payments | **Stripe** (AUD) writing into an `entitlements` table. The app never asks Stripe anything at request time. |
+| Payments | **None in v1.** Build the `entitlements` table and a hard usage cap; Stripe comes in phase 2 as a *writer* to that table. |
+| Free-tier cap | **10 audio-hours per org per month**, enforced on server-probed duration. Plus 3 concurrent in-flight recordings and a platform-wide circuit breaker. |
+| Recording consent | Per-jurisdiction disclaimer, acknowledged on **every** upload. Collect **state/territory only** — no address, no postcode. |
+| Carer access | **No delegated access in v1.** A carer signs up and uploads under their own account. |
 | Languages | **English only** (incl. Australian accents). Reject non-English uploads with a clear message. |
 | Live recording | **Out of scope.** Phase 3. Do not design around it. |
 
@@ -46,6 +49,10 @@ These exist for legal and safety reasons. Breaking any of them is a defect, not 
 **4. Audio is transient.** Raw audio is deleted 7 days after successful processing by a scheduled purge job. This is a legal requirement (destroy when no longer needed), not a cost optimisation. No public buckets ever — add a CI test that asserts it. Signed URLs expire in ≤15 minutes.
 
 **5. The AI never silently commits a speaker identity.** Haiku suggests labels; they render as visibly unconfirmed until a human confirms. Attributing "stop taking the warfarin" to the wrong person is a serious error.
+
+**6. Recording consent is acknowledged on every upload, never once at signup.** Australian surveillance-device law is state-based and inconsistent — in some jurisdictions every party must agree before a private conversation is recorded, in others a participant may record. The user is attesting to a fact about *this specific recording*, so a signup checkbox cannot carry that meaning. The disclaimer shown is the one for `recorded_in_state`, and the recording stores which state and which disclaimer **version** was acknowledged, so the exact wording is reconstructable later.
+
+**7. Never trust the client for quota.** The soft check at `POST /v1/uploads` uses a client-supplied duration hint and exists only to avoid a pointless 400 MB upload. The real gate runs in the `audio-qc` worker against the **server-probed** duration.
 
 ---
 
@@ -72,16 +79,27 @@ Run the schema in DESIGN.md §7.2 as the first migration. Every table listed the
 
 Supabase Auth, email + magic link. **JWT bearer + refresh, not cookie sessions** — mobile needs bearer tokens and switching later is an auth rewrite.
 
-Signup auto-creates a `kind='personal'` organisation with the user as `owner`. Every query is org-scoped through a **single data-access module**. RLS stays enabled and correct on every table holding personal information; the API passes the user JWT through to Postgres on request-scoped connections so RLS actually applies. Service-role key is for the worker and explicitly-marked admin paths only, all of which write to `audit_log`.
+Signup auto-creates a `kind='personal'` organisation with the user as `owner`, plus an `entitlements` row (`plan='free'`, `source='none'`, `audio_seconds_per_period=36000`). Profile carries `state_territory` (a dropdown of the eight states/territories) — **not** an address and **not** a postcode; it is all the disclaimer logic needs, and holding more is an APP 3 data-minimisation problem. Every query is org-scoped through a **single data-access module**. RLS stays enabled and correct on every table holding personal information; the API passes the user JWT through to Postgres on request-scoped connections so RLS actually applies. Service-role key is for the worker and explicitly-marked admin paths only, all of which write to `audit_log`.
 
 ### 2. Consent + upload
-Consent screen recording `terms`, `privacy` and `overseas_disclosure` into `consents` with **type, version, timestamp, IP, user agent**. The overseas-disclosure consent must be a distinct, unticked choice that names what is sent and to which countries (United States, Ireland) — not a line buried in the ToS. Version bumps re-ask.
 
-Per-upload attestation checkbox: *"I had consent to make this recording."* → `recordings.consent_attested_at`. Recording laws differ by Australian state; onboarding must say so.
+**Account-level consents.** A screen recording `terms`, `privacy` and `overseas_disclosure` into `consents` with **type, version, timestamp, IP, user agent**. The overseas-disclosure consent must be a distinct, unticked choice naming what is sent and to which countries (United States, Ireland) — not a line buried in the ToS. A version bump re-asks.
 
-`POST /v1/uploads` → `recordings` row + presigned PUT. **Client uploads directly to storage; audio never transits the API.** `POST /v1/recordings/{id}/complete` validates the object and transactionally enqueues the pipeline.
+**Per-upload recording consent.** Seed `jurisdiction_disclaimers` with a row per state/territory (NSW, VIC, QLD, SA, WA, TAS, NT, ACT), version 1. Use clearly-marked placeholder copy — **the real wording is lawyer-drafted and is not your call.** The structure is the deliverable.
 
-Accept mp3, m4a, wav, aac, ogg, flac, mp4/mov. Cap 3 hours / 500 MB.
+The upload form:
+1. Shows a `recorded_in_state` dropdown, **pre-filled from the profile but changeable** — the applicable law follows where the conversation happened, not where the uploader lives, which matters for interstate specialists and travel.
+2. Fetches `GET /v1/jurisdictions/{state}/disclaimer` and renders the active body for that state, re-fetching when the dropdown changes.
+3. Requires an explicit tick of that state's `acknowledgement_label` — all parties consented to being recorded.
+4. Submits `recorded_in_state`, `consent_disclaimer_version` and `consent_attested: true`.
+
+The server returns `422` unless all three are present **and** the version is currently active for that state. If the copy changed between page load and submit, the client re-fetches and re-prompts. That strictness is the entire point of versioning it. Store `recorded_in_state`, `consent_disclaimer_state`, `consent_disclaimer_version`, `consent_attested_at` on the recording.
+
+Onboarding copy must say plainly that recording laws differ by state and to ask the doctor first. **Build nothing that enables covert recording** — no hidden capture, no auto-start, no "discreet mode".
+
+**Upload mechanics.** `POST /v1/uploads` → soft quota check → `recordings` row + presigned PUT. **Client uploads directly to storage; audio never transits the API.** `POST /v1/recordings/{id}/complete` validates the object and transactionally enqueues the pipeline.
+
+Accept mp3, m4a, wav, aac, ogg, flac, mp4/mov. Cap 3 hours / 500 MB per recording.
 
 ### 3. Pipeline
 State machine on `recordings.status`, with transitions written to `recording_events`:
@@ -89,11 +107,11 @@ State machine on `recordings.status`, with transitions written to `recording_eve
 created → uploading → uploaded → queued → transcribing → transcribed
         → suggesting_speakers → awaiting_speaker_confirmation
         → summarising → ready
-failures: failed_upload | failed_audio_qc | failed_transcription | failed_extraction
+failures: failed_upload | failed_audio_qc | failed_quota_exceeded | failed_transcription | failed_extraction
 ```
 
 Workers, in order:
-- **`audio-qc`** — duration, sample rate, silence ratio, clipping. Reject junk *before* spending on transcription.
+- **`audio-qc`** — probe duration, sample rate, silence ratio, clipping. Reject junk *before* spending on transcription. **This is also the hard quota gate:** if the probed duration would exceed the org's remaining allowance, transition to `failed_quota_exceeded`, **purge the audio immediately** (never hold audio you will not process) and stop. On success, write the immutable `usage_ledger` row.
 - **`transcribe`** — submit to AssemblyAI with a ≤15-min signed URL, `language_code: en_au`, diarization on, medical keyterm boost list. Store `provider_job_id`. AssemblyAI calls back to `POST /v1/webhooks/assemblyai` (HMAC-verified, unauthenticated route); the handler transitions state and enqueues the next job. Normalise into `transcript_segments`; keep the provider payload in `transcripts.provider_raw`.
 - **`suggest-speakers`** — Haiku 4.5 over the first ~2,000 tokens → `{speaker_key, suggested_label, suggested_role, confidence}` into `speakers`. Unconfirmed.
 - **`extract`** — Sonnet 5, details below.
@@ -134,8 +152,30 @@ Upload with progress · recording list with status chips · processing view poll
 
 Click-to-source is the trust mechanism of this product. Don't treat it as a nice-to-have.
 
-### 6. Billing
-Stripe Checkout + customer portal. The webhook writes `entitlements(org_id, plan, status, source='stripe', external_ref, current_period_end)`. **Every authorisation check reads `entitlements`; nothing calls Stripe at request time.** Apple in-app purchase becomes a second writer to the same table later — that is the entire reason this abstraction exists. Do not integrate RevenueCat or StoreKit now.
+### 6. Usage cap (there is no billing in v1)
+
+v1 is free — **no Stripe, no checkout, no RevenueCat, no StoreKit.** But free over a metered AI pipeline is an open tab: at ~$0.22 per audio-hour, one user uploading 100 hours costs $22 and nothing bills to make you notice. So build the quota machinery now. It is the exact machinery the paid tier will use, so none of it is throwaway.
+
+**Usage accounting.** Do **not** compute usage as a `SUM` over `recordings` — delete a recording, reclaim quota, repeat forever. Instead every processed recording writes an immutable row that survives deletion of the recording itself:
+```
+usage_ledger(id, org_id, recording_id, period_ym, audio_seconds, created_at)
+```
+`recording_id` is deliberately **not** a foreign key, because the recording gets purged. The ledger holds durations only, no content, so retention and deletion rules never touch it.
+
+Remaining = `entitlements.audio_seconds_per_period − SUM(usage_ledger.audio_seconds WHERE period_ym = current)`.
+
+**Four limits:**
+
+| Limit | Value | Enforced |
+|---|---|---|
+| Monthly allowance | 10 audio-hours / org | Soft at `POST /v1/uploads` (client hint, UX only); **hard in `audio-qc` on probed duration** |
+| Per recording | 3 hours / 500 MB | At upload and in `audio-qc` |
+| Concurrent in-flight | 3 non-terminal recordings / org | `POST /v1/uploads` → `429` |
+| Platform circuit breaker | Configurable monthly total audio-hours | Stops accepting uploads, alerts |
+
+`GET /v1/usage` returns `{period_ym, audio_seconds_used, audio_seconds_limit, in_flight_count}` so the UI can show remaining allowance.
+
+**Every authorisation and quota check reads `entitlements`. Nothing calls a payment provider at request time.** In phase 2 Stripe's webhook becomes one writer to that table; in phase 4 Apple IAP becomes a second. Neither changes a single read. That is the whole reason to build it this way before there is any money.
 
 ### 7. Eval harness — build it, don't defer it
 `/evals/medical_visit/` — 20–30 consultation transcripts (synthetic plus consented, de-identified real) with hand-written gold outputs. Grade on:
@@ -153,7 +193,12 @@ GET    /v1/me                                  user, orgs, entitlements, outstan
 DELETE /v1/me                                  account deletion + purge cascade
 POST   /v1/consents                            {type, version}
 GET    /v1/templates
+GET    /v1/jurisdictions/{state}/disclaimer    active body + acknowledgement label + version
+GET    /v1/usage                               {period_ym, used, limit, in_flight_count}
 POST   /v1/uploads                             → {recording_id, upload_url, expires_at}
+                                               422 unless recorded_in_state +
+                                               active consent_disclaimer_version +
+                                               consent_attested:true; 429 if in-flight limit hit
 POST   /v1/recordings/{id}/complete            → 202, enqueues pipeline
 GET    /v1/recordings                          ?status=&template_key=&cursor=&limit=
 GET    /v1/recordings/{id}                     POLL TARGET — cheap single-row read
@@ -167,10 +212,9 @@ GET    /v1/recordings/{id}/outputs             version history
 GET    /v1/outputs/{id}
 PATCH  /v1/outputs/{id}/action-items/{aid}     {completed?, edited_text?}
 POST   /v1/outputs/{id}/export                 {format: pdf|markdown|docx}
-POST   /v1/billing/checkout
-POST   /v1/billing/portal
 POST   /v1/webhooks/assemblyai                 HMAC-verified
-POST   /v1/webhooks/stripe                     signature-verified
+
+# /v1/billing/* is PHASE 2. No checkout in v1.
 ```
 Errors as RFC 9457 `application/problem+json`. Cursor pagination. `Idempotency-Key` honoured on all POSTs. `Retry-After` on every `202`.
 
@@ -187,8 +231,12 @@ Errors as RFC 9457 `application/problem+json`. Cursor pagination. `Idempotency-K
 - [ ] Deleting a recording removes the audio object; deleting an account purges everything
 - [ ] Audio auto-purges 7 days after processing, verified by a test
 - [ ] `audit_log` has a row for every read and mutation of health information
-- [ ] Consent records carry type, version, timestamp, IP and user agent
-- [ ] Stripe checkout grants entitlement; the app never calls Stripe to authorise
+- [ ] Account consent records carry type, version, timestamp, IP and user agent
+- [ ] Every upload stores the state and the disclaimer version acknowledged; a stale version is rejected with 422
+- [ ] Changing `recorded_in_state` on the upload form swaps the disclaimer shown
+- [ ] Quota is enforced on server-probed duration, not the client hint; over-quota audio is purged, not retained
+- [ ] Deleting a recording does **not** restore quota (`usage_ledger` proves it)
+- [ ] `GET /v1/usage` reflects reality after a completed upload
 - [ ] Eval harness runs in CI and the medication gate passes
 - [ ] CI asserts no public storage buckets
 - [ ] OpenAPI spec generates from the Zod schemas and is committed
@@ -197,7 +245,9 @@ Errors as RFC 9457 `application/problem+json`. Cursor pagination. `Idempotency-K
 
 ## Explicitly out of scope for v1
 
-Live recording · meeting/lecture/personal templates · share links · clinic tenancy UI · mobile app · Apple IAP · multilingual · transcript editing · EHR or My Health Record integration · any clinical inference, interpretation or advice.
+Payments and checkout of any kind · live recording · meeting/lecture/personal templates · share links · delegated carer access · clinic tenancy UI · mobile app · Apple IAP · multilingual · transcript editing · EHR or My Health Record integration · any clinical inference, interpretation or advice.
+
+A carer who wants to manage someone's appointments signs up for their own account and uploads there — delegated access raises questions about authority over another person's health information that need legal input, so it is deliberately deferred. The schema supports adding it without migration.
 
 Build the `domain_templates` table and the template registry so a second template is a data change. Populate only `medical_visit`.
 
@@ -205,7 +255,7 @@ Build the `domain_templates` table and the template registry so a second templat
 
 ## Cost reference
 
-≈ **$0.22 USD per audio-hour** all-in (AssemblyAI $0.17 + Sonnet 5 ~$0.047 + Haiku ~$0.003). A 30-minute consultation costs about **$0.11**. AI spend is not this product's constraint — do not micro-optimise it at the expense of output quality. Full model and volume tiers in DESIGN.md §7.5.
+≈ **$0.22 USD per audio-hour** all-in (AssemblyAI $0.17 + Sonnet 5 ~$0.047 + Haiku ~$0.003). A 30-minute consultation costs about **$0.11**. A fully-saturated free account (10 hours) costs ≈ **$2.20/month** — that number is why the cap exists. AI spend is not this product's constraint — do not micro-optimise it at the expense of output quality. Full model and volume tiers in DESIGN.md §7.5.
 
 ---
 

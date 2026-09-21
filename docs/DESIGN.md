@@ -17,12 +17,15 @@ These four answers drove everything below. If any changes, the affected sections
 | v1 buyer | B2C patients now, **clinic tenancy stubbed into the schema** | §7.2 data model (`organisations` from day one), §7.4 roadmap |
 | Ops appetite | Managed services now, **documented swap path** to self-hosting | §3 provider interface, §5 queue choice |
 | Languages | English only (incl. Australian accents) | §3 vendor scoring, §7.4 (multilingual is phase 5) |
+| Recording consent | Per-jurisdiction disclaimer, acknowledged on **every** upload. State/territory collected, nothing more | §4.6, §7.2 (`jurisdiction_disclaimers`) |
+| Carer access | **No delegated access in v1** — a carer uses their own account | §7.2, §7.4 |
+| Billing | **Free in v1 behind a hard usage cap.** Stripe deferred to phase 2 | §5.2, §7.3, §7.4, §7.5 |
 
 ### Four pushbacks on the brief
 
 **1. The buyer problem is bigger than the build problem.** "Heidi but for patients" is a clean framing technically, but Heidi sells to clinicians who feel the pain every day and have a budget line. A patient who has one GP visit a year will not hold a subscription. The users with recurring need are narrower: people managing a chronic or newly-diagnosed condition, carers (especially adult children managing an ageing parent's appointments), and patients in complex specialist pathways (oncology, fertility, paediatric). Recommend targeting that ICP explicitly in v1 copy and onboarding, because it changes retention far more than any architecture decision here. It is also the reason stubbing clinic tenancy is the right call — the clinic paying to reduce "what did the doctor say?" callbacks is a plausible second buyer, and you want the schema ready.
 
-**2. Recording consent is a real legal risk that the brief does not mention.** Surveillance/listening device laws in Australia are **state-based, not federal**, and they differ materially. In NSW (Surveillance Devices Act 2007) recording a private conversation generally requires consent of all principal parties; Victoria permits a party to the conversation to record it; Queensland similarly. A patient recording their GP without asking may be committing an offence in some states. This is squarely a product problem: it needs onboarding copy, a per-upload attestation, and a terms clause putting responsibility on the uploader. Details in §4.6. Do not ship without it.
+**2. Recording consent is a real legal risk that the brief does not mention.** Surveillance/listening device laws in Australia are **state-based, not federal**, and they differ materially. In NSW (Surveillance Devices Act 2007) recording a private conversation generally requires consent of all principal parties; Victoria permits a party to the conversation to record it; Queensland similarly. A patient recording their GP without asking may be committing an offence in some states. This is squarely a product problem. **Resolved in this design:** the app collects the user's state/territory, shows the disclaimer written for that jurisdiction, and requires an explicit acknowledgement that all parties consented — on *every single upload*, never once at signup. Full design in §4.6.
 
 **3. "Domain as a config layer" is right, but the prompt is the easy part — the *eval* is what actually varies.** A meeting summary that drops an action item is an annoyance. A medical summary that drops a medication dose change, or invents one, is a harm. These need different quality bars, not just different prompts. Build a golden-set eval harness for the medical template in v1 (§3.4), not as a later nicety. It is ~2 days of work and it is the difference between shipping responsibly and hoping.
 
@@ -203,7 +206,7 @@ created → uploading → uploaded → queued → transcribing → transcribed
         → suggesting_speakers → awaiting_speaker_confirmation
         → summarising → ready
 ```
-Failure states: `failed_upload`, `failed_audio_qc`, `failed_transcription`, `failed_extraction`. Terminal: `deleted`.
+Failure states: `failed_upload`, `failed_audio_qc`, `failed_quota_exceeded`, `failed_transcription`, `failed_extraction`. Terminal: `deleted`.
 
 `awaiting_speaker_confirmation` is non-blocking — a first-pass output is generated with suggested labels so the user sees something immediately; confirming labels enqueues a regeneration that supersedes it. Blocking the summary on a human step would gut the perceived speed of the product.
 
@@ -261,7 +264,7 @@ APP 11.1 requires reasonable steps to protect the information. APP 11.2 requires
 | Transcript + segments | Until user deletes; org default 24 months | This is the product |
 | Outputs | Until user deletes | Versioned; supersession keeps history |
 | Audit log | 7 years | Evidentiary; also aligns with the HIPAA 6-year rule for the US seam |
-| Consent records | 7 years after account closure | Evidentiary |
+| Consent records (incl. per-upload attestations) | 7 years after account closure | Evidentiary — this is the record you would rely on if a recording's lawfulness were ever challenged |
 | Deleted account | Hard purge within 30 days | Audit stub retained with user id hashed |
 
 Controls:
@@ -293,14 +296,20 @@ Enforced in three places so it cannot drift:
 
 Anything that would cross this line (symptom checking, "you should ask about X", risk scoring, medication interaction warnings) is out of scope indefinitely, regardless of how easy it looks.
 
-### 4.6 Recording consent — surface it, don't absorb it
+### 4.6 Recording consent — jurisdiction-specific, acknowledged every time
 
-See pushback 2. Surveillance/listening device law is state-based and inconsistent. Required in v1:
+Surveillance and listening device legislation in Australia is **state-based and materially inconsistent**. Broadly, some jurisdictions require the consent of all principal parties to record a private conversation, while others permit a party to the conversation to record it — but the exceptions, definitions and penalties differ enough that a single national disclaimer would be either wrong or useless. The eight jurisdictions each need their own wording: NSW, VIC, QLD, SA, WA, TAS, NT, ACT.
 
-- Onboarding explainer: "Recording laws differ by state. In some states you need everyone's permission to record a private conversation. Ask your doctor before recording — most will say yes."
-- A per-upload attestation checkbox: *"I had consent to make this recording."* Stored on the recording row with timestamp.
-- Terms clause placing responsibility for lawful recording on the uploader.
-- No feature that encourages covert recording. Nothing that hides, disguises, or auto-starts capture.
+**The design:**
+
+1. **Collect state/territory only.** A dropdown on the profile. Not a street address, not a postcode. This is the APP 3 data-minimisation position: it is exactly what the disclaimer logic needs and nothing more, so there is no high-value address data to leak and nothing to justify holding. See also §4.3.
+2. **Jurisdiction is a property of the recording, not the person.** The applicable law generally follows where the conversation occurred, not where the uploader lives. So `recordings.recorded_in_state` is its own field, pre-filled from the profile and changeable at upload with a dropdown. This matters for interstate specialists and travel — common for exactly the complex-care patients most likely to use this product. (Telehealth across state lines is genuinely unsettled; the disclaimer copy should acknowledge that rather than assert a clean answer.)
+3. **Acknowledge on every upload, never once at signup.** The user is attesting to a fact about *this specific recording* — that all parties consented. A one-time signup checkbox cannot carry that meaning, and would be worth very little if ever tested.
+4. **Stamp what was shown.** Each recording stores `recorded_in_state`, `consent_disclaimer_state`, `consent_disclaimer_version` and `consent_attested_at`. Disclaimer copy lives in a versioned `jurisdiction_disclaimers` table (§7.2), so you can later prove the exact wording a given user acknowledged on a given day. Changing the copy bumps the version; old recordings keep their original reference.
+5. **Terms clause** placing responsibility for lawful recording on the uploader, and an onboarding explainer along the lines of *"Recording laws differ by state. In some states everyone present has to agree before you record a private conversation. Ask your doctor first — most will say yes."*
+6. **Nothing that encourages covert recording.** No hidden capture, no disguised UI, no auto-start, no "discreet mode". This is a product-values line as much as a legal one, and App Review will read it that way too.
+
+> The per-jurisdiction copy must be drafted or reviewed by an Australian lawyer before real patient recordings. The table structure is the engineering deliverable; the words in it are not.
 
 ### 4.7 The HIPAA seam (US later — flag only, do not build)
 
@@ -336,27 +345,52 @@ Designed for this workload specifically: large binary uploads, minutes-long asyn
 | **Queue / jobs** | **pg-boss** (Postgres-backed) in a dedicated Node worker | No new vendor, no new region to reason about, and **enqueue is transactional with the database write** — which eliminates the classic "row committed but job lost" bug class. Critically, it keeps job payloads (IDs only) inside your own Postgres rather than a third-party queue that would become an undisclosed recipient of health information (§4.2). Upgrade to Inngest/Trigger.dev when the pipeline grows fan-out and human-in-the-loop steps — but only if payloads stay ID-only. |
 | **Job status → frontend** | **Polling** `GET /v1/recordings/{id}`, 2s interval with backoff | Transcription takes 30s–3min. One lightweight endpoint, polled, works through every proxy and corporate network, behaves identically from a mobile client, needs no connection state, and survives a worker restart. WebSockets earn their keep with many concurrent live updates or true streaming — i.e. phase 3 live recording. **Free upgrade path:** you are already on Supabase, so Supabase Realtime can push `recordings` row changes over WebSocket whenever you want it, with no new infrastructure. Poll first. |
 | **Hosting** | **Fly.io `syd`** for API + worker; **Cloudflare Pages** for the SPA | Fly has a Sydney region, deploys containers, and runs the API and worker as separate process groups from one config — which is exactly the shape here. The SPA is static JS with no PHI at rest, so its edge location is irrelevant. Migration path when you need VPC isolation, Bedrock Sydney, or enterprise procurement: AWS `ap-southeast-2` on ECS Fargate. |
-| **Payments** | **Stripe** (AUD, Australian entity) **behind an entitlements abstraction** | See §5.2 — this is the one place where a day of work now saves a painful refactor later. |
+| **Payments** | **None in v1.** Build `entitlements` + the usage cap; Stripe (AUD, Australian entity) deferred to phase 2 | See §5.2. Building the table and the quota read now means adding Stripe — and later Apple IAP — is a new *writer*, not a refactor. The cap is not optional: a free tier over a metered AI pipeline is an open tab. |
 | **Observability** | Structured JSON logs, OpenTelemetry traces, Sentry-equivalent with **PII scrubbing on by default** | Error tracking is a subprocessor. Scrub aggressively, send IDs not content, and put it on the register. |
 | **CI** | GitHub Actions: typecheck, lint, unit, integration against ephemeral Postgres, and a **public-bucket assertion** | The bucket check is a one-line test that would have prevented a large share of real-world health data breaches. |
 
-### 5.2 The payments abstraction (build now, ~1 day)
+### 5.2 Entitlements, the usage cap, and the payments seam
 
-Apple generally requires digital subscriptions consumed inside an iOS app to go through in-app purchase. The post-*Epic* US external-link carve-out exists but is jurisdiction-specific and has already moved more than once — do not architect on the assumption it is permanent.
+v1 ships **free**, with no checkout. But free over a metered AI pipeline is an open tab: at ~$0.22 per audio-hour, one enthusiastic user uploading 100 hours costs $22 and generates no billing signal to notice it by. So the quota machinery ships in v1 even though the paywall does not — and it is the same machinery the paid tier will use, so none of it is throwaway.
 
-Do **not** integrate RevenueCat or StoreKit now. Do make sure Stripe is never load-bearing:
+**The table, built now:**
 
 ```
 entitlements (
   org_id, plan, status,
-  source        enum('stripe','apple','google','manual'),
+  source        enum('none','stripe','apple','google','manual'),
   external_ref  text,          -- stripe sub id | apple original_transaction_id
-  current_period_end timestamptz,
+  audio_seconds_per_period int,   -- the cap. free tier default: 36000 (10 hours)
+  period_start, current_period_end timestamptz,
   ...
 )
 ```
 
-Every authorisation check in the app reads `entitlements`. Nothing calls Stripe to ask whether a user is paid. The Stripe webhook is one writer among several; adding Apple later means adding a second writer (via RevenueCat or StoreKit Server Notifications) and changing nothing else.
+Signup creates a `plan='free', source='none'` row. **Every authorisation and quota check in the app reads `entitlements`. Nothing ever calls Stripe to ask whether a user is paid.** In phase 2 the Stripe webhook becomes one writer to this table; in phase 4 Apple in-app purchase (via RevenueCat or StoreKit Server Notifications) becomes a second. Neither changes a single read.
+
+Why the abstraction matters even before there is money: Apple generally requires digital subscriptions consumed inside an iOS app to go through in-app purchase. The post-*Epic* US external-link carve-out exists but is jurisdiction-specific and has already moved more than once — do not architect on the assumption it is permanent. Do **not** integrate RevenueCat or StoreKit now.
+
+**Usage accounting — `usage_ledger`, not a `SUM` over recordings.**
+
+Counting current usage by summing `recordings.duration_ms` has an obvious hole: delete a recording, get your quota back, repeat forever. Instead, every processed recording writes an immutable ledger row that **survives deletion of the recording itself**:
+
+```
+usage_ledger(id, org_id, recording_id, period_ym, audio_seconds, created_at)
+```
+
+Quota remaining = `entitlements.audio_seconds_per_period − SUM(usage_ledger.audio_seconds WHERE period_ym = current)`. The ledger holds no content, so it is unaffected by deletion and retention rules.
+
+**Three enforcement points, because the client cannot be trusted:**
+
+| Point | Check | Behaviour on failure |
+|---|---|---|
+| `POST /v1/uploads` | Soft check against the client-supplied `duration_hint` | Reject before upload — pure UX, saves a pointless 400 MB transfer. Never the real gate. |
+| `audio-qc` worker | **Hard check** against the server-probed actual duration | `failed_quota_exceeded`, **purge the audio immediately** (never hold audio you will not process), surface a clear message |
+| In-flight concurrency | Max 3 recordings in a non-terminal state per org | Reject with `429` — stops burst abuse while quota is still being computed |
+
+**Plus a platform-level circuit breaker.** A configured monthly ceiling on total platform audio-hours; crossing it stops accepting new uploads and alerts. Cheap insurance for a free beta where you have no billing signal to watch. Per-recording duration is separately capped at 3 hours.
+
+Signup is magic-link verified, which raises the cost of trivial multi-account abuse. Don't build more than that for a beta.
 
 ### 5.3 The RLS honesty note
 
@@ -448,12 +482,14 @@ The deciding question is therefore **"does live recording become core?"**, which
 │ CROSS-BORDER (APP 8)  │        │ CROSS-BORDER (APP 8)         │
 └───────────────────────┘        └──────────────────────────────┘
 
-Stripe ──webhook──► API ──► entitlements   (Apple IAP writes here later)
+entitlements ◄── quota reads (v1)    ◄── Stripe webhook (phase 2) ◄── Apple IAP (phase 4)
 ```
 
 **Flow:** client requests an upload slot → API creates `recordings` row + presigned PUT → client uploads directly to storage (never through the API) → client calls `/complete` → API transactionally enqueues `audio-qc` → worker chain runs → AssemblyAI calls back to a signature-verified webhook → worker extracts with Sonnet 5 → status reaches `ready` → the polling client sees it.
 
 **Residency boundary:** everything at rest is in Sydney. Two egress points cross the border, both named on the subprocessor register, both covered by consent + DPA, both replaceable behind an interface.
+
+**Quota boundary:** `audio-qc` is the only place the real usage decision is made, because it is the first point at which the server knows the actual duration. Everything upstream of it is advisory.
 
 ### 7.2 Data model
 
@@ -467,7 +503,11 @@ organisations(
   created_at, deleted_at)
 
 users(id uuid pk /* = supabase auth.users.id */, email citext unique,
-      display_name, created_at, deleted_at)
+      display_name,
+      state_territory text,                        -- NSW|VIC|QLD|SA|WA|TAS|NT|ACT. Default for
+                                                   -- recordings.recorded_in_state. No address, no
+                                                   -- postcode — see §4.6 and APP 3 minimisation.
+      created_at, deleted_at)
 
 memberships(id, org_id fk, user_id fk, role enum('owner','admin','member','viewer'),
             created_at, unique(org_id,user_id))
@@ -479,7 +519,13 @@ recordings(
   failure_reason text,
   storage_bucket text, storage_key text, content_type text,
   byte_size bigint, duration_ms int, checksum_sha256 text,
-  recorded_at timestamptz, consent_attested_at timestamptz not null,
+  recorded_at timestamptz,
+  -- Recording-consent evidence (§4.6). Jurisdiction follows the conversation,
+  -- not the uploader, so this is per-recording and pre-filled from the profile.
+  recorded_in_state text not null,
+  consent_disclaimer_state text not null,
+  consent_disclaimer_version int not null,
+  consent_attested_at timestamptz not null,
   audio_delete_at timestamptz, audio_deleted_at timestamptz,
   created_at, updated_at, deleted_at)
 
@@ -525,15 +571,32 @@ action_items(
   segment_refs int[] not null,
   completed_at timestamptz null, edited_text text)
 
-consents(
+consents(                                        -- account-level consents
   id, user_id fk, org_id fk,
-  type enum('terms','privacy','overseas_disclosure','recording_attestation'),
+  type enum('terms','privacy','overseas_disclosure'),
   version text not null, granted_at, ip inet, user_agent text, revoked_at)
 
+jurisdiction_disclaimers(                        -- per-upload recording-consent copy
+  state_code text,                               -- NSW|VIC|QLD|SA|WA|TAS|NT|ACT
+  version int,
+  body_markdown text not null,                   -- what the law requires in that state
+  acknowledgement_label text not null,           -- the exact checkbox wording
+  is_active bool,
+  created_at,
+  primary key(state_code, version))              -- copy is lawyer-drafted; versions are immutable
+
 entitlements(
-  id, org_id fk, plan text, status text,
-  source enum('stripe','apple','google','manual'), external_ref text,
-  current_period_end timestamptz, created_at, updated_at)
+  id, org_id fk unique, plan text, status text,  -- v1: plan='free', source='none'
+  source enum('none','stripe','apple','google','manual'), external_ref text,
+  audio_seconds_per_period int not null default 36000,   -- 10 hours; the v1 cap
+  period_start timestamptz, current_period_end timestamptz,
+  created_at, updated_at)
+
+usage_ledger(                                    -- immutable; survives recording deletion
+  id, org_id fk, recording_id uuid,              -- NOT a FK: the recording may be purged
+  period_ym text not null,                       -- 'YYYY-MM'
+  audio_seconds int not null, created_at,
+  index(org_id, period_ym))                      -- holds no content, so retention rules don't touch it
 
 audit_log(
   id, org_id, actor_user_id, actor_kind enum('user','worker','admin','system'),
@@ -549,6 +612,8 @@ shares(                                          -- phase 2
 
 **Notes on the shape.**
 `key_points` live inside `outputs.content` because they are read-only prose. `action_items` are a real table because they get checked off, edited and queried across recordings — they have a lifecycle of their own. `transcript_segments.idx` is the grounding anchor: `segment_refs` in the output envelope are indices into it, which is what lets the UI jump from "Dr Chen said to halve the dose" to 14:32 in the transcript. `organisations.data_region` exists on day one even though every row says `'au'`, because backfilling a region column across health records later is exactly the kind of migration nobody wants to run.
+
+Two tables exist purely to make something provable. `jurisdiction_disclaimers` is versioned and immutable so that, for any recording, you can reconstruct the exact consent wording the user was shown on the day they uploaded it — a `consents` row that merely says "attested" proves very little. `usage_ledger` is deliberately not a `SUM` over `recordings`, because a user who can delete a recording to reclaim quota has no quota; it stores durations only, no content, so purging a recording never touches it.
 
 **Output envelope** (`outputs.content`, common to all domains):
 
@@ -576,7 +641,9 @@ REST, `/v1`, JSON, JWT bearer. Errors as RFC 9457 `application/problem+json`. Cu
 | `DELETE` | `/v1/me` | Account deletion + purge cascade (Apple 5.1.1(v), APP 11.2) |
 | `POST` | `/v1/consents` | `{type, version}` → records consent with IP/UA |
 | `GET` | `/v1/templates` | Active domain templates + section manifests |
-| `POST` | `/v1/uploads` | `{filename, content_type, byte_size, duration_hint, template_key, consent_attested}` → `{recording_id, upload_url, expires_at}` |
+| `GET` | `/v1/jurisdictions/{state}/disclaimer` | Active disclaimer body + acknowledgement label + version for a state |
+| `GET` | `/v1/usage` | `{period_ym, audio_seconds_used, audio_seconds_limit, in_flight_count}` |
+| `POST` | `/v1/uploads` | `{filename, content_type, byte_size, duration_hint, template_key, recorded_in_state, consent_disclaimer_version, consent_attested: true}` → `{recording_id, upload_url, expires_at}`. Soft quota check. |
 | `POST` | `/v1/recordings/{id}/complete` | `{checksum_sha256}` → validates object, enqueues pipeline, `202` |
 | `GET` | `/v1/recordings` | List. `?status=&template_key=&cursor=&limit=` |
 | `GET` | `/v1/recordings/{id}` | **Poll target.** `{status, progress_pct, failure_reason, duration_ms, latest_output_id, speakers_confirmed}` |
@@ -591,31 +658,33 @@ REST, `/v1`, JSON, JWT bearer. Errors as RFC 9457 `application/problem+json`. Cu
 | `PATCH` | `/v1/outputs/{id}/action-items/{aid}` | `{completed?, edited_text?}` |
 | `POST` | `/v1/outputs/{id}/export` | `{format: 'pdf'\|'markdown'\|'docx'}` → `{url, expires_at}` (sync for md, `202` + poll for pdf) |
 | `POST` | `/v1/outputs/{id}/shares` | *Phase 2.* `{expires_in_days}` → `{url}` |
-| `POST` | `/v1/billing/checkout` | Stripe Checkout session |
-| `POST` | `/v1/billing/portal` | Stripe customer portal |
 | `POST` | `/v1/webhooks/assemblyai` | Signature-verified provider callback (unauthenticated route, verified by HMAC) |
-| `POST` | `/v1/webhooks/stripe` | Signature-verified; writes `entitlements` |
+| ~~`/v1/billing/*`~~ | | **Phase 2.** No checkout in v1 — see §5.2 |
 
 **Polling contract.** `GET /v1/recordings/{id}` is cheap (single indexed row read, no joins into segments). Client polls every 2s while status is non-terminal, backing off to 5s after 60s, 15s after 5min. Server sends `Retry-After` on `202` responses. When status reaches `ready` or a `failed_*`, the client stops.
 
 **Upload contract.** Audio never transits the API — the client PUTs directly to storage with a presigned URL. This keeps the API tier small and stateless and means a 400 MB upload doesn't occupy an API worker for minutes.
 
+**Consent contract.** `POST /v1/uploads` rejects with `422` unless `recorded_in_state`, a `consent_disclaimer_version` that is *currently active for that state*, and `consent_attested: true` are all present. The server does not accept a stale or mismatched disclaimer version — if the copy changed between page load and submit, the client re-fetches and re-prompts. This is the whole point of versioning it.
+
 ### 7.4 Phased roadmap
 
-**Phase 0 — prep (before code).** Supabase project in `ap-southeast-2`. AssemblyAI account + DPA + no-training setting. Anthropic org + zero-data-retention request. Stripe AU entity. Privacy policy, consent copy, ToS drafted (and lawyer-reviewed before real patients). `docs/SUBPROCESSORS.md` + `docs/INCIDENT-RESPONSE.md` written.
+**Phase 0 — prep (before code).** Supabase project in `ap-southeast-2`. AssemblyAI account + DPA + no-training setting. Anthropic org + zero-data-retention request. Privacy policy, ToS, overseas-disclosure consent copy, and **per-jurisdiction recording-consent copy for all eight states/territories** drafted — and lawyer-reviewed before real patients. (Stripe AU entity moves to phase 2.) `docs/SUBPROCESSORS.md` + `docs/INCIDENT-RESPONSE.md` written.
 
 **Phase 1 — MVP. This is v1.**
-Auth (email + magic link) · personal org auto-created on signup · consent capture incl. recording attestation · upload mp3/m4a/wav/aac/ogg/flac (≤3h, ≤500MB) · audio QC gate · AssemblyAI transcription + diarization · Haiku speaker suggestions · speaker relabel UI · **`medical_visit` template only** · Sonnet 5 extraction with grounding validator · summary / key points / action items / sections view with click-to-transcript · action item checkboxes · PDF + Markdown + copy export · delete recording (audio purge) · delete account · Stripe checkout behind entitlements · audit log · scheduled audio purge job · eval harness with the medication gate.
+Auth (email + magic link) · personal org auto-created on signup · state/territory on profile · account consent capture (terms, privacy, overseas disclosure) · **per-upload jurisdiction disclaimer + consent attestation** · upload mp3/m4a/wav/aac/ogg/flac (≤3h, ≤500MB) · audio QC gate · **free-tier usage cap with `usage_ledger`, three enforcement points and a platform circuit breaker** · AssemblyAI transcription + diarization · Haiku speaker suggestions · speaker relabel UI · **`medical_visit` template only** · Sonnet 5 extraction with grounding validator · summary / key points / action items / sections view with click-to-transcript · action item checkboxes · PDF + Markdown + copy export · delete recording (audio purge) · delete account · audit log · scheduled audio purge job · eval harness with the medication gate.
 
-**Phase 2 — breadth.** `meeting`, `lecture`, `personal` templates + picker · template switching with regeneration · share links with expiry and revocation · transcript search across recordings · transcript inline editing · email delivery of finished summaries.
+*No checkout in v1.* `entitlements` is built and read on every upload; it just has no paid writer yet.
 
-**Phase 3 — capture and tenancy.** Live recording on **web** (`MediaRecorder`, chunked upload, resumable) · clinic tenancy UI (invites, roles, patient records under an org) · state health records act review · envelope encryption for audio.
+**Phase 2 — breadth and money.** **Stripe checkout + customer portal + webhook writing to `entitlements`** (the quota read is already there; this adds a writer) · `meeting`, `lecture`, `personal` templates + picker · template switching with regeneration · share links with expiry and revocation — *this is also the carer story, see below* · transcript search across recordings · transcript inline editing · email delivery of finished summaries.
+
+**Phase 3 — capture and tenancy.** Live recording on **web** (`MediaRecorder`, chunked upload, resumable) · clinic tenancy UI (invites, roles, patient records under an org) · **delegated carer access, if the beta shows demand share links don't satisfy** · state health records act review · envelope encryption for audio.
 
 **Phase 4 — mobile.** Expo React Native consuming the existing `/v1` · Apple IAP via RevenueCat writing to `entitlements` · Privacy Nutrition Label from the subprocessor register · App Review submission with disclaimer evidence.
 
 **Phase 5 — scale and residency.** Self-hosted WhisperX+pyannote on `ap-southeast-2` GPU *or* Deepgram AU (whichever the §7.5 crossover and any residency tightening dictates) · Claude via Bedrock Sydney for in-country inference · US region + BAAs · multilingual.
 
-**Explicitly out of v1:** live recording, multi-domain templates, sharing, clinic tenancy UI, mobile, multilingual, EHR/My Health Record integration, any clinical inference.
+**Explicitly out of v1:** payments/checkout, live recording, multi-domain templates, sharing, delegated carer access, clinic tenancy UI, mobile, multilingual, EHR/My Health Record integration, any clinical inference.
 
 ### 7.5 Cost model (AI layer)
 
@@ -642,7 +711,17 @@ A typical 30-minute consultation therefore costs **≈ $0.11** in AI spend.
 | 5,000 | 10,000 | $850 | $250 | **≈ $1,100** |
 | 25,000 | 50,000 | $4,250 | $1,250 | **≈ $5,500** |
 
-**Margin sanity check.** At A$15/month for a plan covering four 30-minute recordings (2 audio-hours), COGS is ≈ US$0.44 ≈ A$0.67. AI cost is not the constraint on this business; customer acquisition is. That is worth knowing before optimising the pipeline.
+**Free-tier exposure (v1).** With a 10 audio-hour monthly cap, the worst case is **≈ US$2.20 per fully-saturated account per month**. Realistically most beta users will use well under an hour. Useful ceilings to hold in mind:
+
+| Beta accounts | If every account maxed the cap | Realistic (≈1 hr/account/mo) |
+|---|---|---|
+| 50 | $110/mo | $11/mo |
+| 250 | $550/mo | $55/mo |
+| 1,000 | $2,200/mo | $220/mo |
+
+The per-account cap bounds the tail; the platform circuit breaker (§5.2) bounds the total. Set the breaker at a number you are willing to see on a card — for a beta, somewhere around $300–500/month of audio — and revisit it rather than raising it reflexively.
+
+**Margin sanity check for when pricing arrives.** At A$15/month for a plan covering four 30-minute recordings (2 audio-hours), COGS is ≈ US$0.44 ≈ A$0.67. AI cost is not the constraint on this business; customer acquisition is. That is worth knowing before optimising the pipeline.
 
 **Self-hosting crossover.** A `g5.xlarge`-class GPU in `ap-southeast-2` is roughly $875/month always-on. At 25–30× realtime, that is ~18,000 audio-hours of theoretical capacity — but real utilisation on bursty consumer traffic is 20–40%, so plan on 4,000–7,000 usable hours. Against $0.17/hr managed, the **break-even sits around 3,000–5,000 audio-hours/month**, and that ignores the DevOps time, which pushes the honest crossover later still. Revisit when you are sustaining ~5,000 audio-hours/month, or sooner if residency tightens — at which point self-hosting solves two problems at once and the calculation changes.
 
@@ -663,16 +742,19 @@ A typical 30-minute consultation therefore costs **≈ $0.11** in AI spend.
 | Cross-border disclosure challenged | Consent + DPA both in place; versioned consent records; subprocessor register |
 | Recording made unlawfully by the user | Onboarding education, per-upload attestation, terms clause (§4.6) |
 | Scope creep into clinical advice | The §4.5 scope rule enforced in prompt, validator and disclaimer |
-| Long uploads blowing cost | 3-hour cap; per-plan quotas read from `entitlements` |
+| Long uploads blowing cost | 3-hour per-recording cap; per-account quota read from `entitlements` |
+| **Free tier abused or simply over-used** | 10-hour monthly cap enforced on server-probed duration; `usage_ledger` immune to delete-and-retry; 3 concurrent in-flight limit; platform-wide circuit breaker; magic-link verified signup |
+| User acknowledges consent without it being true | The attestation is per-upload, jurisdiction-specific and version-stamped — it shifts responsibility and is provable, which is the realistic goal. It is not, and cannot be, verification. |
 | Buyer never materialises | Narrow the ICP per pushback 1 before scaling spend |
 
 ---
 
 ## 8. Open questions for the product owner
 
-These do not block the build; they should be answered before launch.
+Resolved in this pass: residency posture, v1 buyer, ops appetite, languages, recording-consent mechanism, address scope, carer access, billing shape. What remains:
 
-1. **Pricing shape** — per-recording credits or an hours-per-month subscription? Affects the quota logic in `entitlements` (a day of work either way, but pick before building the paywall).
-2. **Does a carer need to manage recordings for someone else in v1?** Currently modelled as a personal org per user. Carer-managing-parent is a very plausible v1 use case and would want a shared org or a delegate role — cheap now, awkward later.
-3. **Do you want the transcript visible to users by default, or the summary only?** Recommendation: transcript visible, because click-to-source is the trust mechanism — but it changes the read of "who sees raw health information".
-4. **Legal review timing** — privacy policy, consent copy and terms should be lawyer-reviewed before the first real patient recording, not before launch of a closed beta with synthetic data. Confirm which of those two gates you are building to.
+1. **Legal review gate.** The per-jurisdiction recording-consent copy, privacy policy, overseas-disclosure consent and ToS all need an Australian privacy lawyer. The engineering question is only *when*: before a closed beta on synthetic/own-recordings, or before the first real patient recording. Recommendation: build and test against placeholder copy, get the review before any third party's voice is uploaded.
+2. **Transcript visible by default, or summary only?** Recommendation: **visible**. Click-to-source is the product's trust mechanism and it is hard to have one without the other. Flagging it because it changes the answer to "who can see raw health information", which the privacy policy has to state.
+3. **Free-tier cap number.** 10 audio-hours/month is a starting guess (≈US$2.20/account worst case). Watch actual beta usage for a month and set it from data — the mechanism doesn't change, only the integer.
+4. **Does the beta need an invite gate?** Free with no card is the least-friction way to get users and the least-friction way to get abused. An invite code is ~2 hours of work and would let you skip some of the circuit-breaker anxiety. Worth deciding before launch, not before build.
+5. **Product name.** `Voice-Memo` is the repo. Worth settling before the App Store phase, since the bundle identifier and the privacy policy URL both want to be stable.
