@@ -17,6 +17,8 @@ Design pass complete. Implementation not started.
 | Document | Purpose |
 |---|---|
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Full system design: product framing, AI pipeline and vendor selection, Australian privacy compliance, tech stack, data model, API contract, roadmap, cost model |
-| [`docs/HANDOFF.md`](docs/HANDOFF.md) | Self-contained build spec for the implementing session |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | Self-contained build spec — decisions, non-negotiable rules, API surface |
+| [`docs/BUILD-PLAN.md`](docs/BUILD-PLAN.md) | Sequenced ticket backlog for v1, with dependencies and acceptance criteria |
 
-Start with `DESIGN.md` for the reasoning; `HANDOFF.md` is the build order.
+`DESIGN.md` is the reasoning, `HANDOFF.md` is the spec, `BUILD-PLAN.md` is the work.
+To start building, open `BUILD-PLAN.md` and begin at milestone M0.
